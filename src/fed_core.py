@@ -267,15 +267,51 @@ def run_simulation(model_type="enhanced", output_filename="training_history.csv"
             
         return {"mse": aggregated_metrics["mse"]}
 
-    # 5. Run Simulation
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=num_clients,
-        config=fl.server.ServerConfig(num_rounds=50),
-        strategy=SaveModelStrategy(
-            evaluate_metrics_aggregation_fn=weighted_average,
-        ), 
-    )
+    # 5. Run Sequential Simulation to bypass Ray/Flwr multiprocessing crash on Windows
+    print("Initializing Sequential FL Server...")
+    global_model = EnhancedNet(len(feature_cols)) if model_type == "enhanced" else VanillaMLP(len(feature_cols))
+    
+    for round_idx in range(1, 51):
+        print(f"--- Round {round_idx} ---")
+        global_params = global_model.get_shared_parameters()
+        
+        client_updates = []
+        metrics_list = []
+        
+        for cid in range(num_clients):
+            # Create client
+            client = client_fn(str(cid))
+            
+            # Pack global params into list of numpy arrays
+            param_list = [val.detach().cpu().numpy() for _, val in global_params.items()]
+            
+            # Train
+            updated_params, num_samples, _ = client.fit(param_list, {})
+            client_updates.append((updated_params, num_samples))
+            
+            # Eval
+            _, _, metrics = client.evaluate(param_list, {})
+            metrics_list.append((num_samples, metrics))
+            
+        # Aggregate logic (FedAvg)
+        total_samples = sum([num for _, num in client_updates])
+        aggregated_ndarrays = []
+        for i in range(len(client_updates[0][0])):
+            weighted_sum = sum([client_updates[j][0][i] * client_updates[j][1] for j in range(num_clients)])
+            aggregated_ndarrays.append(weighted_sum / total_samples)
+            
+        # Update global model
+        params_dict = zip(global_params.keys(), aggregated_ndarrays)
+        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+        global_model.load_state_dict(state_dict, strict=False)
+        
+        # Aggregate metrics
+        weighted_average(metrics_list)
+        
+    # Save final model
+    params_np = [val.detach().cpu().numpy() for _, val in global_model.get_shared_parameters().items()]
+    np.savez("global_model_weights.npz", *params_np)
+    print("Simulation complete! Saved global_model_weights.npz")
 
 if __name__ == "__main__":
     run_simulation()
